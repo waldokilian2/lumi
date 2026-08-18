@@ -1,0 +1,17 @@
+[Unit]
+Description=Lumi — rev C LCD panel daemon
+# Starts at boot (requires: loginctl enable-linger <user>) and is stopped at
+# shutdown/logout, at which point SIGTERM makes the daemon TURNOFF the screen.
+After=graphical-session.target
+
+[Service]
+Type=simple
+# install.sh rewrites this to point at ~/.local/bin/lumi on the PATH.
+ExecStart=lumi daemon
+KillSignal=SIGTERM
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

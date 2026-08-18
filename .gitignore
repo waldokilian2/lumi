@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Installer / runtime artifacts
+*.log
+*.mp4
+*.png
+!ui_preview.png
+
+# Local test/sample media (not part of the project)
+/GIF/
+/video/
