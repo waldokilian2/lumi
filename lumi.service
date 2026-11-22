@@ -9,7 +9,7 @@ Type=simple
 # install.sh rewrites this to point at ~/.local/bin/lumi on the PATH.
 ExecStart=lumi daemon
 KillSignal=SIGTERM
-TimeoutStopSec=10
+TimeoutStopSec=45
 Restart=on-failure
 RestartSec=5
 

@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -29,7 +31,7 @@ from typing import Optional
 import numpy as np
 from PIL import Image
 
-from lumi import layouts, sensors
+from lumi import layouts
 from lumi.log import logger
 from lumi.sensors import Metrics
 from lumi.widgets import DrawContext
@@ -41,6 +43,50 @@ CONFIG_FILE = STATE_DIR / "overlay.json"
 
 DEFAULT_CONFIG: dict = {"enabled": True, "layout": "clock"}
 
+STAT_LABELS = {
+    "cpu.freq": "CPU frequency",
+    "cpu.temp": "CPU temperature",
+    "gpu.temp": "GPU temperature",
+}
+
+
+def stat_settings(cfg: dict) -> dict:
+    """Validate persisted readout settings, in the panel's 480px coordinates."""
+    result = {}
+    stored = cfg.get("stats", {})
+    if not isinstance(stored, dict):
+        stored = {}
+    for i, key in enumerate(STAT_LABELS):
+        raw = stored.get(key, {})
+        if not isinstance(raw, dict):
+            raw = {}
+
+        def number(name, default, lo, hi):
+            try:
+                return max(lo, min(hi, int(raw.get(name, default))))
+            except (TypeError, ValueError, OverflowError):
+                return default
+
+        def color(name, default):
+            value = raw.get(name, default)
+            if (isinstance(value, str) and len(value) == 7 and value.startswith("#")
+                    and all(c in "0123456789abcdefABCDEF" for c in value[1:])):
+                return value
+            return default
+
+        source = raw.get("source", key)
+        result[key] = {
+            "enabled": bool(raw.get("enabled", True)),
+            "source": source if isinstance(source, str) and source else key,
+            "x": number("x", 240, 0, 479),
+            "y": number("y", 180 + i * 60, 0, 479),
+            "size": number("size", 30, 8, 96),
+            "color": color("color", "#FFFFFF"),
+            "background_color": color("background_color", "#0C0E16"),
+            "background_opacity": number("background_opacity", 100, 0, 100),
+        }
+    return result
+
 
 # --- layout helpers --------------------------------------------------------
 
@@ -48,6 +94,24 @@ def get_layout(cfg: Optional[dict]):
     """Resolve the active Layout from a config dict (``layout`` or legacy
     ``preset`` key)."""
     cfg = cfg or {}
+    if (cfg.get("layout") or cfg.get("preset")) == "sensors":
+        widgets = []
+        for key, settings in stat_settings(cfg).items():
+            if settings["enabled"]:
+                label = {"cpu.freq": "CPU", "cpu.temp": "CPU", "gpu.temp": "GPU"}[key]
+                widgets.append({
+                    "type": "text", "data": settings["source"],
+                    "format": label + " {value:.0f}{unit}",
+                    "placeholder": label + " --",
+                    "pos": [settings["x"], settings["y"]],
+                    "plate": {
+                        "color": settings["background_color"],
+                        "alpha": round(settings["background_opacity"] * 255 / 100),
+                        "pad": 6, "radius": 5,
+                    },
+                    "size": settings["size"], "color": settings["color"],
+                })
+        return layouts.Layout.from_spec({"id": "sensors", "interval": 2.0, "widgets": widgets})
     return layouts.load_layout(cfg.get("layout") or cfg.get("preset"))
 
 
@@ -69,8 +133,9 @@ def load_config() -> dict:
             if "enabled" in user:
                 cfg["enabled"] = bool(user["enabled"])
             lid = user.get("layout") or user.get("preset")
-            if lid and lid in layouts.all_specs():
+            if lid and (lid == "sensors" or lid in layouts.all_specs()):
                 cfg["layout"] = lid
+            cfg["stats"] = stat_settings(user)
     except FileNotFoundError:
         save_config(cfg)               # first run: persist defaults
     except (json.JSONDecodeError, ValueError) as e:
@@ -79,6 +144,7 @@ def load_config() -> dict:
     except Exception as e:
         logger.warning(f"overlay: could not read {CONFIG_FILE}: {e}; using defaults.")
     # Back-compat alias: always surface the active layout as ``preset`` too.
+    cfg["stats"] = stat_settings(cfg)
     cfg["preset"] = cfg["layout"]
     return cfg
 
@@ -90,10 +156,20 @@ def save_config(cfg: dict) -> None:
              "layout": cfg.get("layout", "clock")}
     # Keep the legacy key on disk too so downgrades/old tools still parse it.
     clean["preset"] = clean["layout"]
-    tmp = str(CONFIG_FILE) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(clean, f, indent=2)
-    os.replace(tmp, CONFIG_FILE)
+    clean["stats"] = stat_settings(cfg)
+    with tempfile.NamedTemporaryFile(mode="w", dir=STATE_DIR, prefix="overlay-",
+                                     suffix=".tmp", delete=False) as f:
+        tmp = f.name
+        try:
+            json.dump(clean, f, indent=2)
+        except Exception:
+            os.unlink(tmp)
+            raise
+    try:
+        os.replace(tmp, CONFIG_FILE)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def set_enabled(enabled: bool) -> None:
@@ -104,7 +180,7 @@ def set_enabled(enabled: bool) -> None:
 
 def set_layout(layout_id: str) -> None:
     """Select the active overlay layout (persisted; picked up on next enable)."""
-    if layout_id not in layouts.all_specs():
+    if layout_id != "sensors" and layout_id not in layouts.all_specs():
         logger.warning(f"overlay: unknown layout {layout_id!r}; ignoring.")
         return
     cfg = load_config()
@@ -119,7 +195,7 @@ def set_preset(preset_id: str) -> None:
 
 def list_layouts() -> list:
     """Layouts for the GUI dropdown / ``--list``: ``[{"id", "label"}, ...]``."""
-    return layouts.list_layouts()
+    return layouts.list_layouts() + [{"id": "sensors", "label": "Configurable sensors"}]
 
 
 def list_presets() -> list:
@@ -129,17 +205,37 @@ def list_presets() -> list:
 
 # --- rendering -------------------------------------------------------------
 
+_preview_metrics = {}
+_preview_source_metrics: Optional[Metrics] = None
+_preview_fonts = FontResolver()
+_preview_poll_lock = threading.Lock()
+_preview_last_poll = 0.0
+
+
+def _poll_preview_metrics():
+    global _preview_metrics, _preview_source_metrics, _preview_last_poll
+    try:
+        if _preview_source_metrics is None:
+            _preview_source_metrics = Metrics()
+        _preview_source_metrics.poll()
+        # Publish a complete snapshot; Qt never waits for external sensor tools.
+        _preview_metrics = _preview_source_metrics.snapshot()
+    except Exception as e:
+        logger.warning(f"overlay: preview sensor poll failed: {e}")
+    finally:
+        _preview_last_poll = time.monotonic()
+        _preview_poll_lock.release()
+
+
 def render_layer(cfg: dict, panel: int, now: datetime) -> Image.Image:
     """Render the active layout to a transparent RGBA layer. Shared by the
-    device push path and the GUI preview (WYSIWYG). Polls a fresh metric
-    snapshot each call (suitable for ~1 Hz preview refresh)."""
+    device push path and the GUI preview (WYSIWYG). Shares a background-polled
+    snapshot between previews so external sensor tools never block Qt."""
     layout = get_layout(cfg)
-    metrics = Metrics()
-    try:
-        metrics.poll()
-    except Exception as e:
-        logger.warning(f"overlay: metric poll failed in render_layer: {e}")
-    ctx = DrawContext(panel=panel, now=now, metrics=metrics, fonts=FontResolver())
+    if time.monotonic() - _preview_last_poll >= 1 and _preview_poll_lock.acquire(False):
+        threading.Thread(target=_poll_preview_metrics, name="lumi-preview-sensors",
+                         daemon=True).start()
+    ctx = DrawContext(panel=panel, now=now, metrics=_preview_metrics, fonts=_preview_fonts)
     return layout.render(ctx)
 
 
@@ -243,7 +339,7 @@ class OverlayRenderer:
             return False
         try:
             dev.push_overlay_frame(Image.fromarray(new, mode="RGBA"))
-            logger.info("overlay refreshed (cmd 202 + 208 mask)")
+            logger.info("overlay frame sent (cmd 202 + 208; visual display is not acknowledged)")
             return True
         except OSError:
             # The serial link is gone (USB drop, port closed, ...). Propagate so
@@ -275,20 +371,24 @@ class OverlayLoop:
         self.interval = float(self.renderer.interval)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self.error: Optional[OSError] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._stop.clear()
+        self.error = None
         self._thread = threading.Thread(target=self._run, name="lumi-overlay", daemon=True)
         self._thread.start()
         logger.info("overlay loop started")
 
-    def stop(self, timeout: float = 3.0) -> None:
+    def stop(self, timeout: Optional[float] = None) -> None:
         self._stop.set()
         t = self._thread
         if t and t.is_alive():
             t.join(timeout=timeout)
+            if t.is_alive():
+                raise TimeoutError("Overlay transfer is still running; serial port must remain open.")
         self._thread = None
         logger.info("overlay loop stopped")
 
@@ -296,6 +396,11 @@ class OverlayLoop:
         while not self._stop.is_set():
             try:
                 self.renderer.tick(self.dev)
+            except OSError as e:
+                self.error = e
+                self._stop.set()
+                logger.error(f"overlay connection lost; stopping refresh: {e}")
+                break
             except Exception as e:  # never let the loop die silently
                 logger.warning(f"overlay tick error: {e}")
             # Wait the interval, but wake promptly on stop.

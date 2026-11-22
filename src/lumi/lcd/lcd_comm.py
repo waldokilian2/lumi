@@ -108,14 +108,21 @@ class LcdComm(ABC):
             logger.debug(f"Static COM port: {self.com_port}")
 
         try:
-            self.lcd_serial = serial.Serial(self.com_port, 115200, timeout=1, rtscts=True)
+            self.lcd_serial = serial.Serial(self.com_port, 115200, timeout=1,
+                                            write_timeout=3, rtscts=True, exclusive=True)
         except Exception as e:
             logger.error(f"Cannot open COM port {self.com_port}: {e}")
             raise
 
     def closeSerial(self):
         if self.lcd_serial is not None:
-            self.lcd_serial.close()
+            try:
+                # Discard pending bytes on a failed connection instead of
+                # letting close/destruction wait for an unresponsive device.
+                if self.lcd_serial.is_open:
+                    self.lcd_serial.reset_output_buffer()
+            finally:
+                self.lcd_serial.close()
 
     def serial_write(self, data: bytes):
         assert self.lcd_serial is not None
@@ -127,11 +134,24 @@ class LcdComm(ABC):
 
     def serial_readall(self) -> bytes:
         assert self.lcd_serial is not None
-        return self.lcd_serial.readall()
+        # pyserial's read_all() drains only bytes already queued. readall()
+        # is inherited from IOBase and blocks until the serial timeout, making
+        # short protocol settle windows (e.g. 300 ms) last over a second.
+        return self.lcd_serial.read_all()
 
     def serial_flush_input(self):
         if self.lcd_serial is not None:
             self.lcd_serial.reset_input_buffer()
+
+    def serial_flush_output(self):
+        if self.lcd_serial is not None:
+            # tcdrain()/Serial.flush() can wait forever after a USB/CTS stall,
+            # even when writes have a timeout. Bound the drain as well.
+            deadline = time.monotonic() + 3
+            while self.lcd_serial.out_waiting:
+                if time.monotonic() >= deadline:
+                    raise serial.SerialTimeoutException("Panel output buffer did not drain")
+                time.sleep(.01)
 
     def WriteData(self, byteBuffer: bytearray):
         self.WriteLine(bytes(byteBuffer))
@@ -152,16 +172,13 @@ class LcdComm(ABC):
                 # See https://github.com/mathoudebine/turing-smart-screen-python/issues/7
                 self.lcd_serial.flush()
         except serial.SerialTimeoutException:
-            # We timed-out trying to write to our device, slow things down.
-            logger.warning("(Write line) Too fast! Slow down!")
+            # Continuing would send the rest of a frame after a partial write,
+            # corrupting the stream. Let callers reconnect the whole session.
+            logger.warning("Panel write timed out; reconnect required.")
+            raise
         except serial.SerialException:
-            # Error writing data to device: close and reopen serial port, try to write again
-            logger.error(
-                "SerialException: Failed to send serial data to device. Closing and reopening COM port before retrying once.")
-            self.closeSerial()
-            time.sleep(1)
-            self.openSerial()
-            self.serial_write(line)
+            logger.error("Panel serial write failed; the complete session must be reconnected.")
+            raise
 
     def ReadData(self, readSize: int):
         try:

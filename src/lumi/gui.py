@@ -10,9 +10,10 @@ Run with:  lumi gui
 from __future__ import annotations
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt, QTimer
-from PySide6.QtGui import QFont, QPixmap, QIcon, QMovie, QColor
+from PySide6.QtGui import QPixmap, QIcon, QMovie, QColor
 from pathlib import Path
 from datetime import datetime
+from typing import NamedTuple
 
 
 def _find_logo() -> Path:
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QPushButton,
     QSlider, QLabel, QListWidget, QFileDialog, QStatusBar, QGroupBox, QMessageBox,
     QComboBox, QAbstractItemView, QProgressDialog, QGridLayout, QCheckBox,
-    QTabWidget, QFormLayout,
+    QTabWidget, QFormLayout, QSpinBox, QColorDialog,
 )
 
 from lumi import Device, DeviceError, find_panel
@@ -60,6 +61,13 @@ def _daemon_start():
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _pause_daemon() -> bool:
+    """Cancel running and queued service starts before taking the serial port."""
+    resume = _daemon_active() or _daemon_enabled()
+    _daemon_stop()
+    return resume
+
+
 class _LogSignal(QObject):
     """Marries stdlib logging (worker thread) to a Qt signal (UI thread)."""
     fired = Signal(str)
@@ -75,6 +83,17 @@ class GuiLogHandler(logging.Handler):
             self._sig.fired.emit(self.format(record))
         except Exception:
             pass
+
+
+class SensorControls(NamedTuple):
+    enabled: QCheckBox
+    source: QComboBox
+    x: QSpinBox
+    y: QSpinBox
+    size: QSpinBox
+    color: QPushButton
+    background: QPushButton
+    opacity: QSpinBox
 
 
 # --------------------------------------------------------------------------- worker
@@ -144,6 +163,15 @@ class DeviceWorker(QObject):
             self._playing = base
             self.now_playing.emit(base)
             self.preview_request.emit(device_path)
+            # Upload/play paths stop the decoder, which can hide its overlay
+            # compositor. Restore the selected overlay after the media command
+            # and subsequent library refresh have completed on this thread.
+            if self._overlay_renderer is not None:
+                from lumi import overlay
+                if overlay.load_config().get("enabled"):
+                    from PySide6.QtCore import QMetaObject
+                    QMetaObject.invokeMethod(self, "apply_overlay",
+                                             Qt.ConnectionType.QueuedConnection)
         else:
             self._playing = None
             self.now_playing.emit("")
@@ -184,14 +212,14 @@ class DeviceWorker(QObject):
                     try:
                         if last.get("kind") == "video" and last.get("device_name"):
                             self.log.emit(f"Resuming last video: {last['device_name']}")
-                            if M.play_stored(lcd, last["device_name"]):
+                            if M.play_stored(lcd, last["device_name"], stop_first=False):
                                 self._set_playing(last["device_name"])
                         elif last.get("kind") == "image":
                             from pathlib import Path
                             if last.get("device_name"):
                                 # Stored image: replay from the device (cmd 140).
                                 self.log.emit(f"Resuming last image: {last['device_name']}")
-                                if M.play_image_stored(lcd, last["device_name"]):
+                                if M.play_image_stored(lcd, last["device_name"], stop_first=False):
                                     self._set_playing(last["device_name"])
                             elif last.get("path") and Path(last["path"]).exists():
                                 # Legacy live image (not stored): show directly.
@@ -424,7 +452,9 @@ class DeviceWorker(QObject):
             overlay.set_enabled(bool(enabled))
         except Exception as e:
             self.log.emit(f"overlay config: {e}")
-        self._stop_overlay()
+        # Enabling/reconfiguring replaces the complete layer. Never clear it
+        # first: an empty visibility mask can disable the firmware compositor.
+        self._stop_overlay(clear=not enabled)
         if not enabled:
             self.log.emit("Overlay off.")
             return
@@ -436,6 +466,7 @@ class DeviceWorker(QObject):
             self._overlay_renderer = overlay.OverlayRenderer(cfg, panel=self.dev.width)
             if self._overlay_timer is None:
                 self._overlay_timer = QTimer()
+                self._overlay_timer.setSingleShot(True)
                 self._overlay_timer.timeout.connect(self._overlay_tick)
             ms = max(100, int(overlay.layout_interval(cfg) * 1000))
             self._overlay_timer.start(ms)
@@ -454,6 +485,11 @@ class DeviceWorker(QObject):
                 # — then drop the stale device and reconnect.
                 self.log.emit(f"Panel link lost ({e.__class__.__name__}); reconnecting…")
                 self._handle_panel_lost()
+            if self.dev and self._overlay_timer is not None:
+                # Measure the refresh interval after a completed transfer. A
+                # repeating timer immediately fired again when sending took
+                # longer than its interval, keeping the compositor busy.
+                self._overlay_timer.start(max(100, int(self._overlay_renderer.interval * 1000)))
 
     def _handle_panel_lost(self):
         """Recover from a lost serial link: stop the overlay loop, drop the stale
@@ -479,55 +515,24 @@ class DeviceWorker(QObject):
         else:
             self.log.emit("Panel unstable; pausing before retry.")
 
-    def _stop_overlay(self):
+    def _stop_overlay(self, clear=True):
         if self._overlay_timer is not None:
             self._overlay_timer.stop()
         if self._overlay_renderer is not None:
             self._overlay_renderer.reset()
-        if self.dev:
+        if clear and self.dev:
             try:
                 self.dev.clear_overlay()
             except Exception:
                 pass
 
-    def _replay_current_media(self):
-        """Re-trigger the current media to reset the device's overlay layer —
-        the confirmed clean 'first-frame' establish path (play media, then send
-        cmd 202+208). Best-effort: video > image > black."""
-        from lumi import media as M
-        last = state.load_last()
-        try:
-            if last and last.get("kind") == "video" and last.get("device_name"):
-                if M.play_stored(self.dev.lcd, last["device_name"]):
-                    return
-            if last and last.get("kind") == "image" and last.get("device_name"):
-                if M.play_image_stored(self.dev.lcd, last["device_name"]):
-                    return
-            from PIL import Image
-            self.dev.show_image(Image.new("RGB", (self.dev.width, self.dev.height), (0, 0, 0)))
-        except Exception as e:
-            self.log.emit(f"media replay: {e}")
-
     @Slot()
     def apply_overlay(self):
-        """(Re)establish the overlay from the current config — the GUI 'Apply'
-        button. Mirrors the confirmed-working paths: the daemon's periodic
-        refresh and the GUI autostart. Both just push a fresh cmd 202 (colours)
-        + cmd 208 (mask) frame over the *already-playing* media — no media
-        stop/re-play.
+        """Replace the selected overlay without touching the media player.
 
-        Do NOT call ``_replay_current_media`` here. ``stop_media`` (cmd 121 +
-        150) fired while an overlay layer is active disrupts the device's one
-        persistent overlay layer, so the 202+208 push that follows lands on a
-        reset layer and the overlay reads as blank/hidden — the exact symptom
-        this method used to produce. The daemon's refresh loop (which only ever
-        sends 202+208, never stop/play) is the proof that re-pushing the frame
-        alone is the correct re-establishment.
-
-        Also do NOT send an empty visibility mask (cmd 208 EF69-only): the
-        decompiled official app only ever sends cmd 208 when the mask has
-        content; an empty mask invalidates the device's overlay state so
-        subsequent pushes are silently ignored."""
+        Consecutive frames were verified on the physical panel. Playback must
+        remain undisturbed while updating settings or restoring an overlay.
+        """
         from lumi import overlay
         self.busy.emit(True)
         self.progress.emit("Applying overlay…", -1.0)
@@ -542,9 +547,11 @@ class DeviceWorker(QObject):
             # Fresh renderer -> _prev is None -> tick() does a FULL 202+208 push
             # (replaces colours + mask), swapping the on-device overlay wholesale.
             self._overlay_renderer = overlay.OverlayRenderer(cfg, panel=self.dev.width)
-            self._overlay_renderer.tick(self.dev)
+            if not self._overlay_renderer.tick(self.dev):
+                raise DeviceError("Overlay frame could not be sent; see the log for details.")
             if self._overlay_timer is None:
                 self._overlay_timer = QTimer()
+                self._overlay_timer.setSingleShot(True)
                 self._overlay_timer.timeout.connect(self._overlay_tick)
             self._overlay_timer.start(max(100, int(overlay.layout_interval(cfg) * 1000)))
             self.log.emit(f"Overlay applied: {cfg.get('layout')}")
@@ -565,6 +572,14 @@ class DeviceWorker(QObject):
             self._overlay_timer.stop()
         if self._overlay_renderer is not None:
             self._overlay_renderer.reset()
+
+    @Slot()
+    def release_panel(self):
+        """Finish worker operations, then release the port for the daemon."""
+        self.stop_overlay()
+        if self.dev is not None:
+            self.dev.close()
+            self.dev = None
 
 
 # --------------------------------------------------------------------------- preview file dialog
@@ -713,9 +728,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         # Take over from the daemon (they can't share the serial port). The
         # daemon is restarted on close so boot-resume + shutdown-TURNOFF persist.
-        self._resume_daemon_on_close = _daemon_active()
+        self._resume_daemon_on_close = _pause_daemon()
+        # Stop also cancels a pending systemd auto-restart. is-active alone
+        # misses that state and allows the daemon to race the GUI for the port.
         if self._resume_daemon_on_close:
-            _daemon_stop()
             self._log("Stopped the lumi daemon to take over the panel.")
             # Wait for the daemon to release the device.
             import time as _t
@@ -784,7 +800,7 @@ class MainWindow(QMainWindow):
         left.addWidget(self.now_label)
         row = QHBoxLayout()
         b_load = QPushButton("Load Media…"); b_load.clicked.connect(self._load_media)
-        b_apply = QPushButton("Apply to Panel"); b_apply.setObjectName("primary")
+        b_apply = QPushButton("Apply Media to Panel"); b_apply.setObjectName("primary")
         b_apply.clicked.connect(self._apply)
         b_reset = QPushButton("Reset Fit"); b_reset.clicked.connect(self.preview._reset_transform_to_fit)
         row.addWidget(b_load); row.addWidget(b_apply, 1); row.addWidget(b_reset)
@@ -897,13 +913,65 @@ class MainWindow(QMainWindow):
         form.addRow("Overlay", self.ov_preset)
         lay.addLayout(form)
 
+        self.ov_stats = QGroupBox("Sensor readouts")
+        grid = QGridLayout(self.ov_stats)
+        for col, title in enumerate(("Show", "Sensor", "X", "Y", "Font (px)",
+                                     "Text color", "Background", "Opacity")):
+            grid.addWidget(QLabel(title), 0, col)
+        self._stat_controls: dict[str, SensorControls] = {}
+        for row, (key, settings) in enumerate(overlay.stat_settings(cfg).items(), 1):
+            enabled = QCheckBox(overlay.STAT_LABELS[key])
+            enabled.setChecked(settings["enabled"])
+            source = QComboBox()
+            source.setMinimumWidth(170)
+            source.addItem("Automatic (fastest core)" if key == "cpu.freq" else "Automatic", key)
+            if settings["source"] != key:
+                source.addItem(settings["source"], settings["source"])
+                source.setCurrentIndex(1)
+            spins = []
+            for name, maximum in (("x", 479), ("y", 479), ("size", 96)):
+                spin = QSpinBox()
+                spin.setRange(8 if name == "size" else 0, maximum)
+                spin.setValue(settings[name])
+                spin.setToolTip("Text center in 480 × 480 panel pixels" if name != "size"
+                                else "Font size in panel pixels")
+                spins.append(spin)
+            color = QPushButton(settings["color"])
+            color.setStyleSheet(f"color: {settings['color']}")
+            color.clicked.connect(lambda _=False, k=key: self._choose_stat_color(k))
+            background = QPushButton(settings["background_color"])
+            self._style_background_button(background)
+            background.clicked.connect(lambda _=False, k=key: self._choose_stat_color(k, True))
+            opacity = QSpinBox()
+            opacity.setRange(0, 100)
+            opacity.setSuffix("%")
+            opacity.setValue(settings["background_opacity"])
+            opacity.setToolTip("Background opacity: 0% transparent, 100% solid. Text stays opaque.")
+            controls = SensorControls(enabled, source, *spins, color, background, opacity)
+            self._stat_controls[key] = controls
+            for col, control in enumerate(controls):
+                grid.addWidget(control, row, col)
+            enabled.toggled.connect(self._save_stat_settings)
+            source.currentIndexChanged.connect(self._save_stat_settings)
+            for spin in spins:
+                spin.valueChanged.connect(self._save_stat_settings)
+            opacity.valueChanged.connect(self._save_stat_settings)
+        refresh = QPushButton("Refresh available sensors")
+        refresh.clicked.connect(self._discover_stat_sensors)
+        grid.addWidget(refresh, 4, 0, 1, 2)
+        self.ov_sensor_status = QLabel("Automatic selection; unavailable readings show --.")
+        self.ov_sensor_status.setWordWrap(True)
+        grid.addWidget(self.ov_sensor_status, 4, 2, 1, 6)
+        self.ov_stats.setVisible(cur == "sensors")
+        lay.addWidget(self.ov_stats)
+
         # Explicit Apply: cleanly (re)establish the selected overlay on the panel
         # with the UI locked. Changing the dropdown only updates the preview +
         # persists the choice (no live push — that accumulated corruption).
-        self.ov_apply = QPushButton("Apply to Panel")
+        self.ov_apply = QPushButton("Apply Overlay to Panel")
         self.ov_apply.setObjectName("primary")
-        self.ov_apply.setToolTip("Cleanly (re)establish the selected overlay on the panel "
-                                 "(clears + re-triggers the media first).")
+        self.ov_apply.setToolTip("Replace the panel overlay with the current settings "
+                                 "while keeping the media playing.")
         self.ov_apply.clicked.connect(self._on_apply_overlay)
         lay.addWidget(self.ov_apply)
 
@@ -928,8 +996,14 @@ class MainWindow(QMainWindow):
         self._ov_preview_timer = QTimer(self)
         self._ov_preview_timer.timeout.connect(self._refresh_ov_preview)
         self._ov_preview_timer.start(1000)
+        # Initial state is display-only. connect_dev owns resume + autostart;
+        # emitting toggled here queued a second connection/start before resume.
+        self.overlay_cb.blockSignals(True)
         self.overlay_cb.setChecked(bool(cfg.get("enabled")))
+        self.overlay_cb.blockSignals(False)
         self._refresh_ov_preview()
+        if cur == "sensors":
+            self._discover_stat_sensors()
         return w
 
     def _refresh_ov_preview(self):
@@ -938,7 +1012,9 @@ class MainWindow(QMainWindow):
         from PIL import Image, ImageDraw, ImageQt
         try:
             pid = self.ov_preset.currentData() or "clock"
-            layer = overlay.render_layer({"layout": pid}, 480, datetime.now())
+            cfg = overlay.load_config()
+            cfg["layout"] = pid
+            layer = overlay.render_layer(cfg, 480, datetime.now())
             bg = Image.new("RGBA", (480, 480), (15, 15, 22, 255))
             comp = Image.alpha_composite(bg, layer)
             mask = Image.new("L", (480, 480), 0)
@@ -958,7 +1034,94 @@ class MainWindow(QMainWindow):
         pid = self.ov_preset.currentData()
         if pid:
             overlay.set_layout(pid)
+        self.ov_stats.setVisible(pid == "sensors")
+        if pid == "sensors":
+            self._discover_stat_sensors()
         self._refresh_ov_preview()
+
+    def _save_stat_settings(self, *_):
+        from lumi import overlay
+        cfg = overlay.load_config()
+        cfg["stats"] = {}
+        for key, controls in self._stat_controls.items():
+            cfg["stats"][key] = {
+                "enabled": controls.enabled.isChecked(),
+                "source": controls.source.currentData(),
+                "x": controls.x.value(), "y": controls.y.value(),
+                "size": controls.size.value(), "color": controls.color.text(),
+                "background_color": controls.background.text(),
+                "background_opacity": controls.opacity.value(),
+            }
+        overlay.save_config(cfg)
+        self._refresh_ov_preview()
+
+    @staticmethod
+    def _style_background_button(button):
+        color = QColor(button.text())
+        ink = "#000000" if color.lightnessF() > .5 else "#FFFFFF"
+        button.setStyleSheet(f"background-color: {color.name()}; color: {ink};")
+
+    def _choose_stat_color(self, key, background=False):
+        controls = self._stat_controls[key]
+        button = controls.background if background else controls.color
+        color = QColorDialog.getColor(QColor(button.text()), self,
+                                      "Background color" if background else "Readout color")
+        if color.isValid():
+            button.setText(color.name().upper())
+            if background:
+                self._style_background_button(button)
+            else:
+                button.setStyleSheet(f"color: {color.name()}")
+            self._save_stat_settings()
+
+    def _discover_stat_sensors(self):
+        """Poll in a background thread so slow driver utilities do not freeze Qt."""
+        from concurrent.futures import ThreadPoolExecutor
+        from lumi.sensors import Metrics
+        if getattr(self, "_sensor_scan", None) is not None:
+            return
+        self.ov_sensor_status.setText("Detecting sensors…")
+        def scan():
+            metrics = Metrics()
+            metrics.poll()
+            return metrics.snapshot()
+        self._sensor_executor = ThreadPoolExecutor(max_workers=1)
+        self._sensor_scan = self._sensor_executor.submit(scan)
+        self._sensor_scan_timer = QTimer(self)
+        self._sensor_scan_timer.timeout.connect(self._finish_sensor_scan)
+        self._sensor_scan_timer.start(100)
+
+    def _finish_sensor_scan(self):
+        if self._sensor_scan is None or not self._sensor_scan.done():
+            return
+        self._sensor_scan_timer.stop()
+        self._sensor_scan_timer.deleteLater()
+        try:
+            samples = self._sensor_scan.result()
+            for key, controls in self._stat_controls.items():
+                combo = controls.source
+                selected = combo.currentData()
+                combo.blockSignals(True)
+                combo.clear()
+                combo.addItem("Automatic (fastest core)" if key == "cpu.freq" else "Automatic", key)
+                for name, sample in sorted(samples.items()):
+                    if name == key:
+                        continue
+                    if (key == "cpu.freq" and sample.unit == "MHz") or (
+                            key != "cpu.freq" and sample.unit == "°C"):
+                        combo.addItem(name, name)
+                idx = combo.findData(selected)
+                if idx < 0:
+                    combo.addItem(f"{selected} (unavailable)", selected)
+                    idx = combo.count() - 1
+                combo.setCurrentIndex(idx)
+                combo.blockSignals(False)
+            self.ov_sensor_status.setText("Sensors refreshed. Choose a sensor, then Apply to Panel.")
+        except Exception as e:
+            self.ov_sensor_status.setText(f"Sensor discovery failed: {e}")
+        finally:
+            self._sensor_executor.shutdown(wait=False)
+            self._sensor_scan = None
 
     def _on_apply_overlay(self):
         """Push the selected overlay to the panel via a clean, locked
@@ -992,6 +1155,7 @@ class MainWindow(QMainWindow):
         # Lock the overlay controls too (Apply/connect/upload must not race with
         # an overlay switch — and the device can't be overwhelmed mid-transfer).
         for w in (getattr(self, "ov_apply", None), getattr(self, "ov_preset", None),
+                  getattr(self, "ov_stats", None),
                   getattr(self, "overlay_cb", None)):
             if w is not None:
                 w.setEnabled(not on)
@@ -1170,12 +1334,20 @@ class MainWindow(QMainWindow):
         """On quit: leave the panel playing its last media; restart the daemon
         (if it was running) so boot-resume + shutdown-TURNOFF keep working."""
         from PySide6.QtCore import QCoreApplication, QMetaObject, Qt
+        if getattr(self, "_closing", False):
+            event.accept()
+            return
+        self._closing = True
+        if getattr(self, "_sensor_scan", None) is not None:
+            self._sensor_scan_timer.stop()
+            self._sensor_executor.shutdown(wait=False, cancel_futures=True)
+            self._sensor_scan = None
         QCoreApplication.processEvents()
         # Stop the worker's overlay QTimer on its OWN thread before quitting,
         # so it isn't stopped/destroyed from the main thread at teardown.
         if self.thread.isRunning():
             try:
-                QMetaObject.invokeMethod(self.worker, "stop_overlay",
+                QMetaObject.invokeMethod(self.worker, "release_panel",
                                          Qt.ConnectionType.BlockingQueuedConnection)
             except Exception:
                 pass
@@ -1196,17 +1368,27 @@ def _invoke_method(worker, method, arg):
 
 def main():
     import sys
+    import signal
     app = QApplication(sys.argv)
     if LOGO_PATH.exists():
         app.setWindowIcon(QIcon(str(LOGO_PATH)))
     from lumi.theme import apply_theme
     apply_theme(app)
     w = MainWindow()
+    # Finish any in-flight serial transfer before exiting on SIGTERM. Abrupt
+    # termination can leave the panel waiting for the remainder of a frame.
+    signal.signal(signal.SIGTERM, lambda *_: w.close())
+    signal.signal(signal.SIGINT, lambda *_: w.close())
     w.show()
-    r = app.exec()
-    # cleanup
-    w.thread.quit(); w.thread.wait(2000)
-    return r
+    try:
+        return app.exec()
+    finally:
+        # Cover quitting the event loop as well as closing the window, so the
+        # port is released and the daemon resumes for either exit path.
+        if not getattr(w, "_closing", False):
+            w.close()
+        w.thread.quit()
+        w.thread.wait(2000)
 
 
 if __name__ == "__main__":

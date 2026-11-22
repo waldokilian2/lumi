@@ -27,7 +27,7 @@ fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
 pip install --quiet --upgrade pip
-pip install --quiet '.[gui]'   # base + GUI (PySide6) — the GUI is the primary interface
+pip install --quiet '.[gui,sensors]'   # GUI plus live CPU metrics
 deactivate
 
 echo "==> [2/4] Putting 'lumi' on PATH (~/.local/bin)..."
@@ -39,7 +39,7 @@ if [[ ":$PATH:" != *":$BIN:"* ]]; then
 fi
 
 echo "==> [3/4] Installing udev rule (serial access without root)..."
-if [[ ! -f /etc/udev/rules.d/99-lumi.rules ]]; then
+if ! cmp -s "$HERE/99-lumi.rules" /etc/udev/rules.d/99-lumi.rules; then
   sudo cp "$HERE/99-lumi.rules" /etc/udev/rules.d/
   sudo udevadm control --reload-rules
   sudo udevadm trigger

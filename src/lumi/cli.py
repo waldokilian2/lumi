@@ -234,13 +234,13 @@ def cmd_daemon(args):
             if last.get("kind") == "video" and last.get("device_name"):
                 from lumi import media
                 logger.info(f"Resuming last video: {last['device_name']}")
-                media.play_stored(dev.lcd, last["device_name"])
+                media.play_stored(dev.lcd, last["device_name"], stop_first=False)
             elif last.get("kind") == "image":
                 from pathlib import Path
                 from lumi import media
                 if last.get("device_name"):
                     logger.info(f"Resuming last image: {last['device_name']}")
-                    media.play_image_stored(dev.lcd, last["device_name"])
+                    media.play_image_stored(dev.lcd, last["device_name"], stop_first=False)
                 elif last.get("path") and Path(last["path"]).exists():
                     logger.info(f"Resuming last image: {last['path']}")
                     media.stop_media(dev.lcd)
@@ -262,11 +262,15 @@ def cmd_daemon(args):
                 time.sleep(2)  # let the resumed video start before overlaying it
                 overlay_loop = overlay.OverlayLoop(dev, ocfg, panel=dev.width)
                 overlay_loop.start()
-                logger.info("Live overlay enabled (clock).")
+                logger.info(f"Live overlay enabled ({ocfg.get('layout', 'clock')}).")
         except Exception as e:
             logger.warning(f"Overlay not started: {e}")
 
         while not stop["flag"]:
+            if overlay_loop and overlay_loop.error is not None:
+                # Exit with an error so systemd reopens the device, resumes the
+                # media, and restores the overlay with a fresh serial session.
+                raise DeviceError(f"Overlay connection lost: {overlay_loop.error}")
             time.sleep(1)
         # Stop the overlay loop before touching the serial line on shutdown.
         if overlay_loop:
@@ -369,6 +373,8 @@ def cmd_overlay(args):
         print("Overlay running (Ctrl-C to stop).")
         try:
             while True:
+                if loop.error is not None:
+                    raise DeviceError(f"Overlay connection lost: {loop.error}")
                 time.sleep(1)
         except KeyboardInterrupt:
             pass

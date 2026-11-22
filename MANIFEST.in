@@ -1,0 +1,3 @@
+include 99-lumi.rules lumi.service install.sh uninstall.sh
+include ui_preview.png docs/sensor-overlays.png
+recursive-include tests *.py

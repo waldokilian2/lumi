@@ -22,9 +22,11 @@ rotate), then push them to the panel. Open-source and built natively for Linux.
   480² H.264, 24 fps) and pushed to the panel's media library, then loop.
 - **Stored-media browser** — list and play anything already on the device.
 - **Brightness, screen on/off, and power off.**
-- **Live overlay (clock)** — render a real-time clock over the playing media
-  (the panel plays the video underneath; Lumi pushes a tiny overlay frame each
-  second). Designed to extend to more widgets (gauges, stats) later.
+- **Live overlays** — render a clock or configurable CPU frequency, CPU
+  temperature, and GPU temperature over the playing media. Select sensors and
+  set each readout's position, font size, text/background color, and background
+  opacity in the GUI. Lumi refreshes the overlay while the panel plays the
+  video underneath.
 - **Autostart + clean shutdown** — an optional daemon resumes your last media on
   boot and turns the panel off when the PC shuts down.
 - **Persistent settings** — brightness and last media survive restarts.
@@ -117,7 +119,51 @@ by default so a reinstall resumes where you left off; `--purge` wipes them.
 content clockwise by default (`--rotate 90` on the CLI; a dropdown in the GUI).
 Override with `--rotate 0|90|180|270` if your panel is mounted differently.
 
-## Live overlay (clock)
+## Live overlays
+
+### Configurable sensor readouts
+
+Open the **Overlay** tab and choose **Configurable sensors**. Each readout has
+a checkbox, a sensor selector, X/Y position, font size, text color, background
+color, and background opacity (0–100%). Text remains opaque when the background
+is made transparent.
+Click **Refresh available sensors** to discover individual CPU cores and
+temperature channels. **Automatic** uses the representative CPU/GPU reading;
+you can choose a specific channel or GPU instead. Automatic CPU frequency uses
+the **highest current core frequency**, rather than the average across cores;
+if per-core readings are unavailable, it falls back to the system CPU frequency.
+You can still select an individual core. Positions are the text center
+in the 480 × 480 panel coordinates (240, 240 is the center); font sizes are
+in panel pixels. Use the round preview to keep text inside the bezel.
+Readouts default to compact dark backings for legibility and to stay within the
+panel's overlay mask limit; customize them using the background controls.
+
+![Configurable sensor overlay controls with demonstration readings](docs/sensor-overlays.png)
+
+Changes update the preview and are saved immediately. Click **Apply Overlay to Panel**
+to activate them on the display. The daemon restores the saved readouts after
+the GUI closes. Unavailable or disconnected sensors display `--`.
+
+The installer includes `psutil` for CPU frequency and Linux temperature sensors.
+For a manual installation, use `pip install '.[gui,sensors]'`. Installing your
+distribution's **lm-sensors** package adds temperature channels via `sensors -j`.
+NVIDIA temperatures are also read through **nvidia-smi** when it is available.
+Available channels depend on the hardware and installed drivers.
+
+Settings live in `~/.config/lumi/overlay.json` under `stats`, keyed by
+`cpu.freq`, `cpu.temp`, and `gpu.temp`. Each stores `enabled`, `source`, `x`,
+`y`, `size`, `color`, `background_color`, and `background_opacity` (percent);
+the selected layout is `"layout": "sensors"`.
+
+Live readings require Lumi to keep running. When the GUI closes, an enabled
+`lumi.service` resumes the overlay in the background. Manual installations can
+enable the installed user service with `systemctl --user enable --now lumi`.
+On the tested 2.1" panel, full overlay transfers result in updates roughly every
+10 seconds, despite the layout's two-second polling interval. Closing the GUI
+can leave a gap of about 15 seconds while the daemon resumes playback and sends
+its first overlay. Other panels and firmware versions have not been tested.
+
+### Clock overlay
 
 Lumi can render a **live clock over a playing video** — the same feature the
 official Windows app offers on this panel.
@@ -141,24 +187,36 @@ lumi overlay --enable   # enable the overlay for the daemon, then exit
 lumi overlay --disable  # disable it, then exit
 ```
 
-- **GUI:** tick *Show clock overlay*; drawn live on the panel and mirrored in the
-  round preview.
-- **Config:** `~/.config/lumi/overlay.json` — format, position, font size,
-  colour, and the plate behind the digits:
+- **GUI:** choose *Clock* in the Overlay tab and enable the overlay; it is
+  drawn on the panel and mirrored in the round preview.
+- **Config:** `~/.config/lumi/overlay.json` selects the layout:
 
   ```json
   {
     "enabled": true,
-    "interval": 1.0,
-    "widgets": [
-      { "type": "clock", "format": "%H:%M", "x": 240, "y": 240,
-        "size": 60, "color": "#FFFFFF", "plate_alpha": 255 }
-    ]
+    "layout": "clock"
   }
   ```
 
-The widget list is designed to grow — a `"type": "clock"` is the first entry,
-and the same framework can later carry gauges/stats (CPU, GPU, …).
+Additional layouts can be added as widget specs in JSON files under
+`~/.config/lumi/overlays/`. For example, save this as `custom-clock.json`,
+then select **Custom clock** in the GUI:
+
+```json
+{
+  "id": "custom-clock",
+  "label": "Custom clock",
+  "interval": 1.0,
+  "widgets": [
+    {"type": "text", "data": "clock.time", "pos": [240, 240],
+     "size": 60, "color": "#FFFFFF", "plate": {"alpha": 255}}
+  ]
+}
+```
+
+Background opacity is encoded in the RGBA overlay and shown in the preview.
+The panel's visibility mask has a binary alpha threshold, so low-opacity edges
+and intermediate blending can differ from the preview depending on firmware.
 
 > Technical note: the overlay colours/mask commands (cmd 202/208) are distinct
 > from the *primary* bitmap command (cmd 200/0xC8), which the video decoder
@@ -195,6 +253,25 @@ The device runs Linux and stores media in its onboard flash:
   (`systemctl --user is-active lumi`) and linger is enabled
   (`loginctl show-user $USER | grep Linger`). The daemon must own the panel at
   shutdown (close the GUI first).
+- **Stats freeze / panel write times out** — Lumi now resets the affected
+  panel's USB connection after a failed reconnect and resumes live updates.
+  Re-run `./install.sh` to update older udev rules; the USB recovery needs
+  access to the panel's USB device node as well as its serial port. Resets
+  are limited to known panel IDs on the failing serial port and have a
+  one-minute cooldown.
+
+## Development checks
+
+```bash
+python -m pip install '.[gui,sensors,test]'
+QT_QPA_PLATFORM=offscreen python -m pytest
+```
+
+Tests use simulated sensor backends and serial connections; no panel or root
+access is required. GUI tests are skipped if PySide6 is not installed.
+Physical-panel checks should also cover applying a layout over a playing video,
+changing media, disabling/re-enabling the overlay, and closing/reopening the
+GUI while the user daemon is enabled.
 
 ## Credits & license
 

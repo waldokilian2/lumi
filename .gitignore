@@ -12,6 +12,7 @@ venv/
 *.mp4
 *.png
 !ui_preview.png
+!docs/sensor-overlays.png
 
 # Local test/sample media (not part of the project)
 /GIF/
