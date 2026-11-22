@@ -19,6 +19,7 @@ dependencies = [
 [project.optional-dependencies]
 gui = ["PySide6>=6.5"]
 sensors = ["psutil>=5.9"]
+test = ["pytest>=7"]
 
 [project.scripts]
 lumi = "lumi.cli:main"

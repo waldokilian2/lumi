@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -79,9 +78,11 @@ def bulk_write(lcd, data: bytes) -> None:
         off += CHUNK
 
 
-def read_text(lcd, timeout: float = 3.0, size: int = 1024) -> str:
+def read_text(lcd, timeout: float = 3.0, size: int = 1024,
+              flush_input: bool = True) -> str:
     """Read a UTF-8 text ACK from the device, draining for up to `timeout` seconds."""
-    lcd.serial_flush_input()
+    if flush_input:
+        lcd.serial_flush_input()
     end = time.time() + timeout
     raw = b""
     while time.time() < end:

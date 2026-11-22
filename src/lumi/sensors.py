@@ -22,10 +22,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import shutil
 import subprocess
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -136,10 +137,37 @@ class PsutilSource(Source):
             out["swap.load"] = (float(self._psutil.swap_memory().percent), "%", 0.0)
         except Exception:
             pass
+        core_frequencies = []
         try:
-            freq = self._psutil.cpu_freq()
-            if freq:
-                out["cpu.freq"] = (float(freq.current), "MHz", 0.0)
+            for i, core in enumerate(self._psutil.cpu_freq(percpu=True) or []):
+                current = float(core.current)
+                if math.isfinite(current) and current > 0:
+                    core_frequencies.append(current)
+                    out[f"cpu.freq.core{i}"] = (current, "MHz", 0.0)
+        except Exception:
+            pass
+        if core_frequencies:
+            out["cpu.freq"] = (max(core_frequencies), "MHz", 0.0)
+        else:
+            try:
+                freq = self._psutil.cpu_freq()
+                if freq and math.isfinite(freq.current) and freq.current > 0:
+                    out["cpu.freq"] = (float(freq.current), "MHz", 0.0)
+            except Exception:
+                pass
+        try:
+            for chip, entries in self._psutil.sensors_temperatures().items():
+                for i, entry in enumerate(entries):
+                    key = f"temp.{chip}.{entry.label or i}"
+                    value = float(entry.current)
+                    if not math.isfinite(value):
+                        continue
+                    out[key] = (value, "°C", _clamp01(value / 100))
+                    alias = ("cpu.temp" if any(c in chip.lower() for c in _CPU_CHIPS)
+                             else "gpu.temp" if any(c in chip.lower() for c in _GPU_CHIPS)
+                             else None)
+                    if alias:
+                        out.setdefault(alias, out[key])
         except Exception:
             pass
         return out
@@ -187,7 +215,9 @@ class LmSensorsSource(Source):
         for k, v in feature.items():
             if k.endswith("_input") and "temp" in k:
                 try:
-                    return float(v)
+                    value = float(v)
+                    if math.isfinite(value):
+                        return value
                 except (TypeError, ValueError):
                     continue
         return None
@@ -201,6 +231,10 @@ class LmSensorsSource(Source):
                 continue
             name = str(chip).lower()
             features = {k: v for k, v in body.items() if k != "Adapter"}
+            for fname, feature in features.items():
+                temp = self._first_temp(feature)
+                if temp is not None:
+                    out[f"temp.{chip}.{fname}"] = (temp, "°C", _clamp01(temp / 100))
             is_cpu = any(s in name for s in _CPU_CHIPS)
             is_gpu = any(s in name for s in _GPU_CHIPS)
             if not (is_cpu or is_gpu):
@@ -235,9 +269,41 @@ class LmSensorsSource(Source):
         return out
 
 
+class NvidiaSource(Source):
+    """GPU temperatures from the optional NVIDIA driver utility."""
+
+    def __init__(self):
+        self._bin = shutil.which("nvidia-smi")
+
+    def poll(self):
+        if not self._bin:
+            return {}
+        try:
+            cp = subprocess.run(
+                [self._bin, "--query-gpu=uuid,temperature.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3, check=False)
+            if cp.returncode:
+                return {}
+            out = {}
+            for line in cp.stdout.splitlines():
+                try:
+                    uuid, raw = line.split(",", 1)
+                    value = float(raw.strip())
+                except ValueError:
+                    continue
+                if not uuid.strip() or not math.isfinite(value):
+                    continue
+                sample = (value, "°C", _clamp01(value / 100))
+                out[f"gpu.temp.{uuid.strip()}"] = sample
+                out.setdefault("gpu.temp", sample)
+            return out
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            return {}
+
+
 def default_sources() -> List[Source]:
     """The default backend set for a live overlay (all optional / degrading)."""
-    return [TimeSource(), PsutilSource(), LmSensorsSource()]
+    return [TimeSource(), PsutilSource(), LmSensorsSource(), NvidiaSource()]
 
 
 # --------------------------------------------------------------------------- registry
@@ -262,6 +328,8 @@ class Metrics:
             except Exception as e:  # never let one backend kill the overlay
                 logger.warning(f"sensors: {src.__class__.__name__} poll failed: {e}")
         for key, (value, unit, rate) in snapshot.items():
+            if not math.isfinite(value):
+                continue
             samp = self._samples.get(key)
             if samp is None:
                 samp = Sample(key=key)
@@ -274,6 +342,10 @@ class Metrics:
             samp.text = unit if key.startswith("clock.") else None
             samp.unit = "" if key.startswith("clock.") else unit
             samp.history.append(value)
+        # A disconnected or failed sensor must not keep displaying an old value.
+        for key in list(self._samples):
+            if key not in snapshot or not math.isfinite(snapshot[key][0]):
+                del self._samples[key]
 
     def get(self, key: Optional[str]) -> Optional[Sample]:
         if not key:
@@ -284,5 +356,6 @@ class Metrics:
         return list(self._samples)
 
     def snapshot(self) -> Dict[str, Sample]:
-        """A shallow copy of the current samples (for read-only iteration)."""
-        return dict(self._samples)
+        """An independent snapshot safe to read while this registry polls again."""
+        return {key: replace(sample, history=sample.history.copy())
+                for key, sample in self._samples.items()}

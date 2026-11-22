@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 from PIL import Image
 
@@ -37,7 +37,10 @@ def find_panel() -> Optional[str]:
     (1d6b:0121 / 0525:a4a7, serial '20080411'). Use Device() to wake it
     automatically if only the dormant interface is present.
     """
-    return LcdCommRevC.auto_detect_com_port()
+    from serial.tools.list_ports import comports
+    # Detection must be read-only. auto_detect_com_port() also opens the wake
+    # interface, so polling it during handoff repeatedly wakes the panel.
+    return LcdCommRevC._get_awake_com_port(comports())
 
 
 class Device:
@@ -73,26 +76,38 @@ class Device:
                     "( asleep 1a86:ca21 / awake 1d6b:0121 / 0525:a4a7 )."
                 )
 
-        logger.info(f"Opening rev C panel on {com_port} ({width}x{height})")
-        self.lcd = LcdCommRevC(
-            com_port=com_port,
-            display_width=width,
-            display_height=height,
-            update_queue=None,
-        )
-        if reset:
-            self.lcd.Reset()
-        self.lcd.InitializeComm()  # HELLO handshake
-        self.lcd.ScreenOn()
-        self.lcd.SetBrightness(brightness)
-        # Portrait by default; themes may override.
-        self.lcd.SetOrientation(Orientation.PORTRAIT)
+        from lumi import usb
+        for attempt in range(2):
+            logger.info(f"Opening rev C panel on {com_port} ({width}x{height})")
+            lcd = None
+            try:
+                lcd = LcdCommRevC(com_port=com_port, display_width=width,
+                                  display_height=height, update_queue=None)
+                self.lcd = lcd
+                if reset:
+                    lcd.Reset()
+                lcd.InitializeComm()  # HELLO handshake
+                lcd.ScreenOn()
+                lcd.SetBrightness(brightness)
+                lcd.SetOrientation(Orientation.PORTRAIT)
+                return
+            except Exception as e:
+                if lcd is not None:
+                    try:
+                        lcd.closeSerial()
+                    except OSError:
+                        pass
+                if (attempt == 0 and isinstance(e, OSError) and usb.recoverable(e)
+                        and usb.reset_panel_usb(com_port)):
+                    com_port = self._wake_and_find() or com_port
+                    continue
+                raise
 
     # --- construction helpers -------------------------------------------------
 
     @staticmethod
     def _wake_and_find() -> Optional[str]:
-        awake = LcdCommRevC.auto_detect_com_port()
+        awake = find_panel()
         if awake:
             return awake
         # Force a wake cycle: open/close the dormant port up to 15x.
@@ -111,7 +126,7 @@ class Device:
             except Exception:
                 pass
             time.sleep(1)
-            awake = LcdCommRevC.auto_detect_com_port()
+            awake = find_panel()
             if awake:
                 time.sleep(1)
                 return awake
@@ -164,7 +179,6 @@ class Device:
         The overlay persists over a playing video; re-send when it changes.
         ``image`` is a full 480x480 PIL RGBA layer (transparent outside widgets).
         """
-        import time
         from lumi import media, overlay
         from lumi.lcd.serialize import image_to_BGRA
         if isinstance(image, (str, Path)):
@@ -174,27 +188,42 @@ class Device:
             image = image.convert("RGBA")
         bgra, _ = image_to_BGRA(image)
         mask = overlay.encode_mask(bgra, self.width, self.height)
-        # cmd 202: overlay colours. A short settle before the bulk payload so the
-        # device has allocated its receive buffer; kept small because a full
-        # 480x480 BGRA frame (~900 KB) already takes noticeable time to stream,
-        # and the analog clock relies on pushes landing roughly once a second.
+        if not mask:
+            # Keep one pixel in the rectangular frame's corner selected. It is
+            # hidden by the round bezel and avoids the empty-mask firmware path.
+            mask = b"\x00\x00\x00\x00\x01"
+        # These settle times match the successful physical-panel diagnostic.
+        # Short gaps can yield seq_png_init_sucess but leave the overlay hidden.
+        # Drain queued replies without discarding them between protocol stages.
+        self.lcd.serial_flush_input()
         media.send_cmd(self.lcd, 0xCA, len(bgra), b"", 0)
-        time.sleep(0.1)
+        init_reply = media.read_text(self.lcd, 2.0, flush_input=False)
         media.bulk_write(self.lcd, bgra)
-        media.read_text(self.lcd, 1.0)
+        self.lcd.serial_flush_output()
+        color_reply = media.read_text(self.lcd, 2.0, flush_input=False)
         # cmd 208: visibility mask (+ EF69 terminator)
         pkt = bytearray(mask) + b"\xef\x69"
         media.send_cmd(self.lcd, 0xD0, len(pkt), b"", 0)
+        mask_init_reply = media.read_text(self.lcd, 0.3, flush_input=False)
         media.bulk_write(self.lcd, bytes(pkt))
-        media.read_text(self.lcd, 1.0)
+        self.lcd.serial_flush_output()
+        mask_reply = media.read_text(self.lcd, 3.0, flush_input=False)
+        logger.info(f"overlay sent: {len(bgra)} color bytes, {len(mask) // 5} mask runs; "
+                    f"panel replies: colors={color_reply!r}, mask={mask_reply!r}")
+        for reply in (init_reply, color_reply, mask_init_reply, mask_reply):
+            if any(word in reply.lower() for word in ("error", "fail", "invalid")):
+                raise DeviceError(f"Panel rejected overlay: {reply}")
 
     def clear_overlay(self) -> None:
-        """Remove the persistent overlay (e.g. when disabling it) by sending an
-        empty visibility mask (cmd 208): the device composites no regions, so the
-        underlying video shows through everywhere."""
+        """Hide the overlay using a single corner pixel behind the round bezel.
+
+        Keep the mask nonempty: an empty cmd 208 mask can leave the firmware
+        ignoring later overlay frames, even though serial writes succeed.
+        """
         from lumi import media
-        media.send_cmd(self.lcd, 0xD0, 2, b"", 0)
-        media.bulk_write(self.lcd, b"\xef\x69")
+        pkt = b"\x00\x00\x00\x00\x01\xef\x69"
+        media.send_cmd(self.lcd, 0xD0, len(pkt), b"", 0)
+        media.bulk_write(self.lcd, pkt)
         media.read_text(self.lcd, 1.0)
 
     def reset(self) -> None:
